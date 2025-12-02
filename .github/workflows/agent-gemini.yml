@@ -1,0 +1,227 @@
+name: AI Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: 'Task ID'
+        default: '01'
+      # [NEW] Inputs for Explicit Handoff
+      mode:
+        description: 'Agent Mode'
+        default: 'coder'
+        type: choice
+        options:
+        - coder
+        - reviewer
+      pr_number:
+        description: 'PR Number (for reviewer mode)'
+        required: false
+  issue_comment:
+    types: [created, edited]
+  pull_request:
+    types: [opened, synchronize]
+    branches: [ "**" ] # [FIX] Allow all branches to ensure trigger
+  pull_request_review:
+    types: [submitted, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write # [NEW] Required to trigger workflows
+
+jobs:
+  coder-gemini:
+    # Run if Mode is Coder (default) AND triggers match
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'coder') ||
+      (github.event_name == 'pull_request_review' && github.event.review.state == 'changes_requested') ||
+      (contains(github.event.comment.body, '/ask') && (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment')) ||
+      (contains(github.event.review.body, '/ask') && github.event_name == 'pull_request_review')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate App Token
+        id: app-coder-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_CODER_ID }}
+          private-key: ${{ secrets.APP_CODER_SECRET }}
+
+      - name: Get PR Branch
+        id: get-branch
+        if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+        env:
+          GH_TOKEN: ${{ steps.app-coder-token.outputs.token }}
+        run: |
+          PR_NUMBER=${{ github.event.issue.number }}
+          BRANCH=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json headRefName -q .headRefName)
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Checkout Repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-coder-token.outputs.token }}
+          ref: ${{ steps.get-branch.outputs.branch || github.event.pull_request.head.ref || github.ref }}
+
+      - name: Setup AI
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - run: pip install google-genai
+
+      - name: Run Coder
+        id: coder_agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TASK_ID: ${{ inputs.task_id || '01' }}
+          PR_QUESTION: >-
+            ${{
+              (contains(github.event.comment.body, '/ask') && github.event.comment.body) ||
+              (contains(github.event.review.body, '/ask') && github.event.review.body) ||
+              ''
+            }}
+          FEEDBACK: ${{ github.event.comment.body || github.event.review.body }}
+          COMMENT_PATH: ${{ github.event.comment.path }}
+          COMMENT_START_LINE: ${{ github.event.comment.start_line }} # for multi line comment
+          COMMENT_END_LINE: ${{ github.event.comment.line }}
+          MODE: 'coder'
+          PYTHONPATH: .github/scripts
+        run: |
+          python .github/scripts/main.py
+
+      - name: Clean & Push Changes
+        id: push_changes
+        env:
+          GH_TOKEN: ${{ steps.app-coder-token.outputs.token }}
+        run: |
+          git config --global user.name "Gemini-Coder[bot]"
+          git config --global user.email "${{ secrets.APP_CODER_ID }}+gemini-coder[bot]@users.noreply.github.com"
+          
+          find . -type d -name "__pycache__" -exec rm -rf {} +
+
+          if [ -f answer.md ]; then
+            touch .gitignore
+
+            if ! grep -Fxq "answer.md" .gitignore; then
+              if [ -s .gitignore ] && [ -n "$(tail -c 1 .gitignore)" ]; then
+                echo "" >> .gitignore
+              fi
+
+              echo "answer.md" >> .gitignore
+            fi
+          fi
+          
+          if [[ -z $(git status -s) ]]; then
+            echo "No code changes implemented."
+          else
+            git add .
+            git commit -m "refactor: AI implementation (Task ${{ inputs.task_id }})"
+            
+            # Resolve Target Branch
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.mode }}" == "coder" ]]; then
+               # Creating new branch logic... (abbreviated for brevity)
+               BRANCH_NAME="refactor/task-${{ inputs.task_id }}-$(date +%s)"
+               git checkout -b "$BRANCH_NAME"
+               git push origin "$BRANCH_NAME"
+               gh pr create --title "Task ${{ inputs.task_id }}" --body "AI Impl" --base "test/esifea/agent" --head "$BRANCH_NAME"
+            else
+               # Updating existing PR
+               TARGET_BRANCH=${{ steps.get-branch.outputs.branch || github.event.pull_request.head.ref }}
+               git push origin HEAD:$TARGET_BRANCH
+               
+               # [NEW] Explicitly Trigger Reviewer
+               # This ensures the loop continues even if GitHub filters the push event
+               if [ ! -f answer.md ]; then
+                  echo "Triggering Reviewer for branch $TARGET_BRANCH..."
+                  gh workflow run gemini-coder.yml \
+                    --ref "$TARGET_BRANCH" \
+                    -f mode=reviewer \
+                    -f pr_number=${{ github.event.issue.number || github.event.pull_request.number }}
+               else
+                   echo "Skipping Reviewer trigger (Q&A mode detected)."
+               fi
+
+               echo "Triggering Reviewer for branch $TARGET_BRANCH..."
+               gh workflow run gemini-coder.yml \
+                 --ref "$TARGET_BRANCH" \
+                 -f mode=reviewer \
+                 -f pr_number=${{ github.event.issue.number || github.event.pull_request.number }} || true
+            fi
+          fi
+
+      - name: Post Reply
+        if: hashFiles('answer.md') != '' && (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment')
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ steps.app-coder-token.outputs.token }}
+          script: |
+            const fs = require('fs');
+            try {
+              if (fs.existsSync('answer.md')) {
+                const response = fs.readFileSync('answer.md', 'utf8');
+
+                if (context.eventName === 'pull_request_review_comment') {
+                  // Reply to threaded review comment
+                  await github.rest.pulls.createReplyForReviewComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: context.payload.pull_request.number,
+                    comment_id: context.payload.comment.id,
+                    body: response
+                  });
+                  console.log("Replied to review comment");
+                } else {
+                  // Reply to general comment
+                  github.rest.issues.createComment({
+                    issue_number: context.issue.number,
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    body: response
+                  });
+                  console.log("Replied to comment");
+                }
+              }
+            } catch (e) {
+              console.log("Error posting comment: " + e);
+              core.setFailed(e.message);
+            }
+
+  reviewer-gemini:
+    # Run if Mode is Reviewer (Explicit) OR standard PR events
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'reviewer') ||
+      (github.event_name == 'pull_request' && github.event.action != 'closed')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate App Token
+        id: app-reviewer-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_REVIEWER_ID }}
+          private-key: ${{ secrets.APP_REVIEWER_SECRET }}
+
+      - name: Checkout Repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.mode == 'reviewer' && github.ref_name || github.event.pull_request.head.ref }}
+
+      - name: Setup AI
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - run: pip install google-genai
+
+      - name: Run Reviewer Logic
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Use Input PR Number (Explicit) OR Event PR Number
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          GH_TOKEN: ${{ steps.app-reviewer-token.outputs.token }}
+          MODE: 'reviewer'
+          PYTHONPATH: .
+        run: python .github/scripts/main.py
