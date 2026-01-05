@@ -60,6 +60,32 @@ jobs:
           BRANCH=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json headRefName -q .headRefName)
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
 
+      - name: Extract Task ID from Branch
+        id: extract-task
+        if: github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment' || github.event_name == 'pull_request_review'
+        run: |
+          BRANCH="${{ steps.get-branch.outputs.branch || github.event.pull_request.head.ref }}"
+          echo "Branch: $BRANCH"
+
+          # Extract task ID from branch name patterns:
+          # - test/task-99-timestamp
+          # - refactor/task-99-timestamp
+          # - 99-feature-name
+          # - task-99
+          TASK_ID=""
+          if [[ "$BRANCH" =~ task-([0-9]+) ]]; then
+            TASK_ID="${BASH_REMATCH[1]}"
+          elif [[ "$BRANCH" =~ ^([0-9]+)[-_] ]]; then
+            TASK_ID="${BASH_REMATCH[1]}"
+          fi
+
+          if [[ -n "$TASK_ID" ]]; then
+            TASK_ID=$(printf "%02d" $((10#$TASK_ID)))
+          fi
+
+          echo "Extracted Task ID: $TASK_ID"
+          echo "task_id=$TASK_ID" >> $GITHUB_OUTPUT
+
       - name: Checkout Repo
         uses: actions/checkout@v6
         with:
@@ -105,17 +131,20 @@ jobs:
             fi
           fi
           
+          # Remove build binary
+          rm -f agent
+
           if [[ -z $(git status -s) ]]; then
             echo "No code changes implemented."
           else
             git add .
-            git commit -m "refactor: AI implementation (Task ${{ inputs.task_id }})"
+            git commit -m "feat: AI implementation (Task ${{ steps.extract-task.outputs.task_id || inputs.task_id }})"
             
             if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.mode }}" == "coder" ]]; then
               BRANCH_NAME="refactor/task-${{ inputs.task_id }}-$(date +%s)"
               git checkout -b "$BRANCH_NAME"
               git push origin "$BRANCH_NAME"
-              gh pr create --title "Task ${{ inputs.task_id }}" --body "AI Implementation" --base "${{ inputs.base_branch || 'main' }}" --head "$BRANCH_NAME"
+              gh pr create --title "Task ${{ steps.extract-task.outputs.task_id || inputs.task_id }}" --body "AI Implementation" --base "${{ inputs.base_branch || 'main' }}" --head "$BRANCH_NAME"
             else
               TARGET_BRANCH=${{ steps.get-branch.outputs.branch || github.event.pull_request.head.ref }}
               git push origin HEAD:$TARGET_BRANCH
