@@ -1,5 +1,5 @@
-name: 'AI Agent'
-description: 'AI-driven code automation with Coder/Reviewer agents using Google Gemini'
+name: 'AI Driven Automation Coder/Reviewer'
+description: 'AI-driven code automation with Coder/Reviewer agents'
 author: 'esifea'
 
 branding:
